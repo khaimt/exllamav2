@@ -98,6 +98,9 @@ class ExLlamaV2BaseGenerator:
 
             logits = self.model.forward(self.sequence_ids[:, -1:], self.cache, input_mask = mask, loras = loras).float().cpu()
             token, _, eos = ExLlamaV2Sampler.sample(logits, gen_settings, self.sequence_ids, random.random(), self.tokenizer, prefix_token = unhealed_token)
+            n_token = token.tolist()[0][0]
+            if n_token == self.tokenizer.eos_token_id:
+                break
             self.sequence_ids = torch.cat([self.sequence_ids, token], dim = 1)
             gen_settings.feed_filters(token)
 
