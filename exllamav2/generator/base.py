@@ -93,15 +93,20 @@ class ExLlamaV2BaseGenerator:
         gen_settings.begin_filters(heal)
 
         # Generate tokens
-
+        stops = [False] if isinstance(prompt, str) else [False for _ in range(len(prompt))]
         for i in range(num_tokens):
 
             logits = self.model.forward(self.sequence_ids[:, -1:], self.cache, input_mask = mask, loras = loras).float().cpu()
             token, _, eos = ExLlamaV2Sampler.sample(logits, gen_settings, self.sequence_ids, random.random(), self.tokenizer, prefix_token = unhealed_token)
-            n_token = token.tolist()[0][0]
-            if n_token == self.tokenizer.eos_token_id:
-                break
             self.sequence_ids = torch.cat([self.sequence_ids, token], dim = 1)
+            for j in range(len(stops)):
+                if token[j].tolist()[0] == self.tokenizer.eos_token_id:
+                    #print(f"{j} stop")
+                    #print(token)
+                    stops[j] = True
+            if all(stops):
+                #print("stop at: ", i)
+                break
             gen_settings.feed_filters(token)
 
             unhealed_token = None
