@@ -23,9 +23,9 @@ from pydantic import BaseModel
 
 # Initialize model and cache
 t1 = datetime.datetime.now()
-model_directory = "/workspace/exllamav2/WizardLM-70B-V1.0-GPTQ"
+model_directory = "WizardLM-70B-V1.0-GPTQ"
 print("Loading model: " + model_directory)
-batch_size = 8
+batch_size = 6
 config = ExLlamaV2Config()
 config.model_dir = model_directory
 config.max_batch_size = batch_size
@@ -66,6 +66,21 @@ Now please generate the answer to this question as an assistant following this f
     return result
 
 
+FINAL_TEMPLATE = """A chat between a curious user and an artificial intelligence assistant. The assistant gives helpful, detailed, and polite answers to the user's questions. USER: You are an intelligent assistant that can generate a final answer to a question based on the provided knowledge. The final answer must first connect the facts from knowledge and then infer the conclusion for the answer to the question. Note that you only generate information based on the knowledge
+====
+Here are the provided knowledge:
+{facts}
+====
+Here is the question: 
+{question}
+====
+Now please generate the final answer for the question by the following format:
++ Summary: summarize the points from knowledge
++ Thought: generate the reasoning to answer the question based on the Summary
++ Answer: The complete answer to the question based on Summary and Thought
+-------------- ASSISTANT:+ Summary:"""
+
+
 def get_batches(mini_size, total):
     iter_num = total // mini_size
     result = []
@@ -82,10 +97,11 @@ def get_batches(mini_size, total):
 def get_prompt_from_item(item, item_index):
     result = []
     for q_index, sub in enumerate(item["sub_questions"]):
-        question = sub["question"]
-        paragraph = sub["paragraph"]
-        prompt = get_qa_prompt(question, paragraph)
-        result.append({"prompt": prompt, "item_index": item_index, "q_index": q_index})
+        if sub.get("long_answer", None) is None:
+            question = sub["question"]
+            paragraph = sub["paragraph"]
+            prompt = get_qa_prompt(question, paragraph)
+            result.append({"prompt": prompt, "item_index": item_index, "q_index": q_index})
     return result
 
 
@@ -113,16 +129,85 @@ def parse_llm_output(output):
     print("-----------cannot parse llm_output: ---------")
     print(output)
     return None, None
-    
+
+import re
+def parse_final_output(output):
+    pattern = "\+\s+Summary:(?P<summary>(.|\n)+)\n\+\s+Thought:(?P<thought>(.|\n)+)\n\+\s+Answer:(?P<answer>(.|\n)+)"
+    match = re.search(pattern, "+ Summary: " + output.strip())
+    if match is not None:
+        summary = match.group("summary").strip()
+        thought = match.group("thought").strip()
+        answer = match.group("answer").strip()
+        return f"Summary: {summary} {thought}" + "\nAnswer: " + answer
+    return None
 
 
-def infer_data(input_path, current_path, save_path):
+def format_prompt(slot_dic, prompt) -> str:
+    if slot_dic is None:
+        return prompt
+    for slot_key, slot_value in slot_dic.items():
+        prompt = prompt.replace("{" + slot_key + "}", slot_value)
+    return prompt 
+
+
+def get_final_answer_prompt(item):
+    question = item["question"]
+    subs = item["sub_questions"]
+    facts = [sub["long_answer"] for sub in subs]
+    fact_str = "\n".join([f"+ {fact}" for fact in facts])
+    slot_dic = {"question": question, "facts": fact_str}
+    return format_prompt(slot_dic, FINAL_TEMPLATE)
+
+
+def handle_final_result(input_path):
     input_items = read_json(input_path)
-    output_items = read_json(current_path)
-    p_items = input_items[len(output_items): ]
-    print("number of items to process: ", len(p_items))
     total_prompts = []
-    for index, item in enumerate(p_items):
+    for index, item in enumerate(input_items):
+        final_answer = item.get("final_answer", None)
+        if final_answer is None:
+            prompt = get_final_answer_prompt(item)
+            total_prompts.append({
+                "item_index": index,
+                "prompt": prompt,
+                "question": item["question"]
+            })
+
+    print("total number of items for processing: ", len(total_prompts))
+    batches = get_batches(batch_size, len(total_prompts))
+    count = 0
+    t1 = datetime.datetime.now()
+    for start, end in batches:
+        prompts = total_prompts[start: end]
+        p_texts = [p["prompt"] for p in prompts]
+        outputs = process_prompts(p_texts)
+        assert len(outputs) == len(p_texts) == len(prompts)
+        for i in range(len(outputs)):
+            final_answer = parse_final_output(outputs[i])
+            if final_answer is not None:
+                item_index = prompts[i]["item_index"]
+                p_item = input_items[item_index]
+                assert p_item["question"] == prompts[i]["question"]
+                p_item["final_answer"] = final_answer
+            else:
+                print("****** CANNOT PARSE OUTPUT****")
+                print("LLM OUTPUT: ")
+                print(outputs[i])
+                print("prompt: ")
+                print(p_texts[i])
+        save_json(input_items, input_path)
+        count += 1
+        t2 = datetime.datetime.now()
+        total_time = (t2 - t1).total_seconds()
+        avg_time = total_time / count
+        remain_count = len(batches) - count
+        print(f"{count}/{len(batches)}, avg_time = {avg_time}, remaining time: {remain_count * avg_time}, item_index: {item_index} / {len(input_items)}")           
+
+
+def infer_data(input_path):
+    input_items = read_json(input_path)
+    print("number of items to process: ", len(input_items))
+    total_prompts = []
+    for index, item in enumerate(input_items):
         ps = get_prompt_from_item(item, index)
         total_prompts.extend(ps)
     print("number of prompts: ", len(total_prompts))
@@ -140,20 +225,21 @@ def infer_data(input_path, current_path, save_path):
             q_index = prompts[i]["q_index"]
             if thought is not None:
                 final_answer = thought + "\nAnswer: " + answer
-                p_items[item_index]["sub_questions"][q_index]["long_answer"] = final_answer
-                p_items[item_index]["meta_info"]["llm"] = "direct"
+                input_items[item_index]["sub_questions"][q_index]["long_answer"] = final_answer
+                input_items[item_index]["meta_info"]["llm"] = "direct"
             
-        save_json(output_items + p_items[: item_index + 1], save_path)
+        save_json(input_items, input_path)
         count += 1
         t2 = datetime.datetime.now()
         total_time = (t2 - t1).total_seconds()
         avg_time = total_time / count
         remain_count = len(batches) - count
-        print(f"{count}/{len(batches)}, avg_time = {avg_time}, remaining time: {remain_count * avg_time}, item_index: {item_index} / {len(p_items)}")            
+        print(f"{count}/{len(batches)}, avg_time = {avg_time}, remaining time: {remain_count * avg_time}, item_index: {item_index} / {len(input_items)}")            
 
 
 def main():
-    infer_data("../data/raw_multi_hop_qa.json", "../data/final.json", "../data/result.json")
+    #infer_data("data/musique_unanswerable.json")
+    handle_final_result("data/musique_filtered.json")
 
 
 if __name__ == "__main__":
